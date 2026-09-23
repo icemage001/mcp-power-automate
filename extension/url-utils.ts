@@ -45,8 +45,6 @@ export const extractFromPortalUrl = (portalUrl: string | null | undefined): Flow
 };
 
 export const extractBestFlowLocation = (urls: Array<string | null | undefined>): FlowLocationWithPortal => {
-  let envId: string | null = null;
-  let flowId: string | null = null;
   let portalUrl: string | null = null;
 
   for (const candidateUrl of urls) {
@@ -58,16 +56,16 @@ export const extractBestFlowLocation = (urls: Array<string | null | undefined>):
       continue;
     }
 
-    envId ||= parsed.envId;
-    flowId ||= parsed.flowId;
     portalUrl = candidateUrl;
 
-    if (envId && flowId) break;
+    if (parsed.envId && parsed.flowId) {
+      return { ...parsed, portalUrl };
+    }
   }
 
   return {
-    envId,
-    flowId,
+    envId: null,
+    flowId: null,
     portalUrl,
   };
 };

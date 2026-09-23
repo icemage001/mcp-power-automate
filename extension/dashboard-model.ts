@@ -244,8 +244,8 @@ const buildAttentionItems = ({
     items.push({
       description: t(
         locale,
-        `This browser tab is showing ${currentTab.displayName}. The MCP will follow the focused captured tab automatically.`,
-        `Esta aba do navegador está mostrando ${currentTab.displayName}. O MCP acompanha automaticamente a aba capturada em foco.`,
+        `This browser tab is showing ${currentTab.displayName}. Flow edits require an explicit environment and flow ID; the MCP does not infer the write target from this tab.`,
+        `Esta aba do navegador está mostrando ${currentTab.displayName}. Edições exigem o ID explícito do ambiente e do fluxo; o MCP não deduz o destino de gravação a partir desta aba.`,
       ),
       id: 'target-mismatch',
       severity: 'warning',

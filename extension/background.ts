@@ -19,6 +19,8 @@ const state: BackgroundState = {
   lastSentSignatures: {},
   tabs: {},
 };
+let workTabSelectionEpoch = 0;
+let workTabSelectionQueue: Promise<void> = Promise.resolve();
 
 const LEGACY_FLOW_BASE_URL = 'https://api.flow.microsoft.com/';
 const CAPTURE_ALARM_NAME = 'pa-mcp-capture-open-tabs';
@@ -458,6 +460,16 @@ const postSelectWorkTabForBridge = async (tabId: number) => {
   return body;
 };
 
+const commitSelectedWorkTab = (tabId: number, selectionEpoch: number) => {
+  workTabSelectionQueue = workTabSelectionQueue.catch(() => undefined).then(async () => {
+    if (selectionEpoch !== workTabSelectionEpoch) return;
+    const [activeTab] = await queryTabs({ active: true, currentWindow: true });
+    if (activeTab?.id !== tabId || selectionEpoch !== workTabSelectionEpoch) return;
+    await postSelectWorkTabForBridge(tabId).catch(() => undefined);
+  });
+  return workTabSelectionQueue;
+};
+
 const persistSessionStatus = async ({ error, health, sentAt, session }: PersistSessionStatusInput) => {
   const payload: StorageShape = {};
 
@@ -510,7 +522,7 @@ const maybeSendSession = async (tabId: number, session: Session) => {
 const getCurrentBrowserTabFlow = async (context: ContextPayload | null) => {
   const [activeTab] = await queryTabs({ active: true, currentWindow: true });
 
-  if (!activeTab?.id) return null;
+  if (!activeTab?.id || !isPowerAutomateUrl(activeTab.url)) return null;
 
   const portalData = extractFromPortalUrl(activeTab.url || '');
   const tabState = state.tabs[activeTab.id];
@@ -746,9 +758,26 @@ const injectCaptureScript = async (tabId: number, frameIds?: number[]) => {
   }
 };
 
-const captureVisiblePowerAutomateTab = async (tabId: number) => {
+const captureVisiblePowerAutomateTab = async (tabId: number, selectWorkTab = false) => {
+  const selectionEpoch = selectWorkTab ? ++workTabSelectionEpoch : null;
   const tab = await getTab(tabId);
   if (!isPowerAutomateUrl(tab?.url)) return;
+  const portalData = extractFromPortalUrl(tab?.url || '');
+  if (!portalData?.envId || !portalData.flowId) {
+    const tabState = state.tabs[tabId];
+    if (tabState) {
+      delete tabState.envId;
+      delete tabState.flowId;
+      delete tabState.apiUrl;
+      delete tabState.apiToken;
+      delete tabState.legacyApiUrl;
+      delete tabState.legacyToken;
+      tabState.portalUrl = tab?.url || undefined;
+    }
+    delete state.lastSentSignatures[tabId];
+    await postRemoveCapturedSessionToBridge(tabId).catch(() => undefined);
+    return;
+  }
 
   const frames = await getPowerAutomateFrames(tabId);
   const frameIds = frames.map((frame) => frame.frameId);
@@ -758,8 +787,8 @@ const captureVisiblePowerAutomateTab = async (tabId: number) => {
   const tabState = getTabState(tabId);
   await hydrateTabFromPortalUrl(tabId, tabState);
 
-  if (tabState.envId && tabState.flowId) {
-    await postSelectWorkTabForBridge(tabId).catch(() => undefined);
+  if (selectionEpoch !== null && tabState.envId && tabState.flowId && selectionEpoch === workTabSelectionEpoch) {
+    await commitSelectedWorkTab(tabId, selectionEpoch);
   }
 
   const session = buildSessionFromTabState(tabState);
@@ -775,6 +804,11 @@ const captureExistingPowerAutomateTabs = async () => {
       .filter((tab) => typeof tab.id === 'number' && isPowerAutomateUrl(tab.url))
       .map((tab) => captureVisiblePowerAutomateTab(tab.id as number).catch(() => undefined)),
   );
+
+  const [activeTab] = await queryTabs({ active: true, currentWindow: true });
+  if (typeof activeTab?.id === 'number' && isPowerAutomateUrl(activeTab.url)) {
+    await captureVisiblePowerAutomateTab(activeTab.id, true).catch(() => undefined);
+  }
 };
 
 type ApiRequestDetails = {
@@ -878,13 +912,29 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
-  void captureVisiblePowerAutomateTab(tabId).catch(() => undefined);
+  void captureVisiblePowerAutomateTab(tabId, true).catch(() => undefined);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete' && !changeInfo.url) return;
-  if (!isPowerAutomateUrl(tab.url || changeInfo.url)) return;
-  void captureVisiblePowerAutomateTab(tabId).catch(() => undefined);
+  if (!isPowerAutomateUrl(tab.url || changeInfo.url)) {
+    const tabState = state.tabs[tabId];
+    if (tabState) {
+      delete tabState.envId;
+      delete tabState.flowId;
+      delete tabState.apiUrl;
+      delete tabState.apiToken;
+      delete tabState.legacyApiUrl;
+      delete tabState.legacyToken;
+      tabState.portalUrl = tab.url || changeInfo.url;
+    }
+    delete state.lastSentSignatures[tabId];
+    void postRemoveCapturedSessionToBridge(tabId).catch(() => undefined);
+    return;
+  }
+  void queryTabs({ active: true, currentWindow: true }).then(([activeTab]) =>
+    captureVisiblePowerAutomateTab(tabId, activeTab?.id === tabId).catch(() => undefined),
+  );
 });
 
 chrome.runtime.onInstalled.addListener(() => {

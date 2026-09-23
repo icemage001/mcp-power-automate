@@ -17,6 +17,7 @@ const expectedV1Commands = [
   'get_flow',
   'preview_flow_update',
   'validate_flow',
+  'get_flow_backups',
   'apply_flow_update',
   'get_last_update',
   'revert_last_update',

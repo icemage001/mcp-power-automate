@@ -82,15 +82,31 @@ export const activeTargetSchema = z.object({
   selectionSource: selectionSourceSchema,
 });
 
-export const updateFlowInputSchema = z.object({
+export const previewFlowUpdateInputSchema = z.object({
   displayName: z.string().trim().min(1).optional(),
   flow: flowContentSchema,
-  target: targetRefSchema.optional(),
+  target: targetRefSchema,
+});
+
+export const updateFlowInputSchema = previewFlowUpdateInputSchema.extend({
+  expectedFlowHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  previewHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  confirmHighRisk: z.boolean().optional(),
+});
+
+export const targetInputSchema = z.object({
+  target: targetRefSchema,
+});
+
+export const revertLastUpdateInputSchema = z.object({
+  confirmHighRisk: z.boolean().optional(),
+  expectedFlowHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  target: targetRefSchema,
 });
 
 export const validateFlowInputSchema = z.object({
   flow: flowContentSchema,
-  target: targetRefSchema.optional(),
+  target: targetRefSchema,
 });
 
 export const flowSnapshotSchema = z.object({
@@ -320,7 +336,7 @@ export const triggerCallbackInputSchema = z.object({
 
 export const invokeTriggerInputSchema = z.object({
   body: z.unknown().optional(),
-  target: targetRefSchema.optional(),
+  target: targetRefSchema,
   triggerName: z.string().trim().min(1).optional(),
 });
 
@@ -336,6 +352,7 @@ export type FlowContent = z.infer<typeof flowContentSchema>;
 export type FlowCatalogItem = z.infer<typeof flowCatalogItemSchema>;
 export type FlowCatalog = z.infer<typeof flowCatalogSchema>;
 export type ActiveTarget = z.infer<typeof activeTargetSchema>;
+export type PreviewFlowUpdateInput = z.infer<typeof previewFlowUpdateInputSchema>;
 export type UpdateFlowInput = z.infer<typeof updateFlowInputSchema>;
 export type ValidateFlowInput = z.infer<typeof validateFlowInputSchema>;
 export type FlowSnapshot = z.infer<typeof flowSnapshotSchema>;

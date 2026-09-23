@@ -25,6 +25,7 @@ import { getLatestCaptureDiagnostic, getLatestCaptureDiagnosticForFlow, loadCapt
 import { listCapturedSessions, loadCapturedSessions, removeCapturedSession, upsertCapturedSession } from './captured-sessions-store.js';
 import { loadDataverseOrgMap } from './dataverse-org-store.js';
 import { loadFlowCatalog } from './flow-catalog-store.js';
+import { loadFlowBackups } from './flow-backup-store.js';
 import { getFlowSnapshot, getFlowSnapshotForFlow, loadFlowSnapshot, saveFlowSnapshot } from './flow-snapshot-store.js';
 import {
   getActiveFlow,
@@ -43,7 +44,7 @@ import {
 import { toErrorPayload } from './errors.js';
 import { getLastRun, loadLastRun } from './last-run-store.js';
 import { getPackageRoot } from './runtime-paths.js';
-import { bridgeHost, bridgePort, capturedSessionSchema, captureDiagnosticSchema, flowIdSchema, flowSnapshotSchema, selectWorkTabInputSchema, sessionSchema, tokenAuditSchema } from './schemas.js';
+import { bridgeHost, bridgePort, capturedSessionSchema, captureDiagnosticSchema, flowIdSchema, flowSnapshotSchema, revertLastUpdateInputSchema, selectWorkTabInputSchema, sessionSchema, tokenAuditSchema } from './schemas.js';
 import { getSession, loadSession, saveSession } from './session-store.js';
 import { clearSelectedWorkTab, getSelectedWorkTab, loadSelectedWorkTab, saveSelectedWorkTab } from './selected-work-tab-store.js';
 import { getTokenAudit, loadTokenAudit, mergeTokenAudit } from './token-audit-store.js';
@@ -292,7 +293,7 @@ export const createBridgeServer = () =>
 
         const effectiveSelectedTabId = getSelectedWorkTab()?.tabId || null;
 
-        if (effectiveSelectedTabId === savedSession.tabId && !getActiveTarget(savedSession.envId)) {
+        if (effectiveSelectedTabId === savedSession.tabId) {
           await saveActiveTarget({
             displayName: null,
             envId: savedSession.envId,
@@ -440,7 +441,8 @@ export const createBridgeServer = () =>
       }
 
       if (request.method === 'POST' && normalizedPath === '/revert-last-update') {
-        const reverted = await revertLastUpdate();
+        const parsed = revertLastUpdateInputSchema.parse(await readJsonBody(request));
+        const reverted = await revertLastUpdate(parsed);
         sendJson(response, 200, {
           flowId: reverted.flow.flowId,
           ok: true,
@@ -514,6 +516,7 @@ const loadLocalState = async () => {
   await loadSession();
   await loadActiveTarget();
   await loadFlowCatalog();
+  await loadFlowBackups();
   await loadFlowSnapshot();
   await loadLastRun();
   await loadTokenAudit();

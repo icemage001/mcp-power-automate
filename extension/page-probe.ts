@@ -1,5 +1,5 @@
 import { BRIDGE_SIGNAL, type RuntimeMessage } from './types.js';
-import { extractBestFlowLocation } from './url-utils.js';
+import { extractBestFlowLocation, extractFromPortalUrl } from './url-utils.js';
 
 type ProbeState = {
   fetchPatched: boolean;
@@ -108,10 +108,20 @@ type ProbeState = {
   const postSnapshot = (payload: {
     displayName?: string;
     flow: { connectionReferences: Record<string, unknown>; definition: Record<string, unknown> };
+    flowId: string;
     source: string;
   }) => {
     const context = getCurrentContext();
-    if (!payload?.flow?.definition || !payload?.flow?.connectionReferences || !context.envId || !context.flowId) return;
+    const directPageLocation = extractFromPortalUrl(window.location.href);
+    if (
+      !payload?.flow?.definition ||
+      !payload?.flow?.connectionReferences ||
+      !context.envId ||
+      !context.flowId ||
+      directPageLocation?.envId?.toLowerCase() !== context.envId.toLowerCase() ||
+      directPageLocation?.flowId?.toLowerCase() !== context.flowId.toLowerCase() ||
+      payload.flowId.toLowerCase() !== context.flowId.toLowerCase()
+    ) return;
 
     const signature = JSON.stringify({
       actions: Object.keys(payload.flow.definition.actions || {}),
@@ -145,11 +155,29 @@ type ProbeState = {
     );
   };
 
-  const normalizeCandidate = (candidate: unknown, source: string) => {
+  const normalizeCandidate = (candidate: unknown, source: string, expectedFlowId: string | null) => {
     if (!candidate || typeof candidate !== 'object') return null;
+    if (!expectedFlowId) return null;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const anyCandidate = candidate as Record<string, any>;
+
+    const properties = anyCandidate.properties;
+    const candidateIds = [
+      anyCandidate.flowId,
+      anyCandidate.workflowId,
+      anyCandidate.resourceId,
+      anyCandidate.id,
+      properties?.flowId,
+      properties?.workflowId,
+      properties?.id,
+      properties?.name,
+    ];
+    const candidateFlowId = candidateIds
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/i)?.[0])
+      .find(Boolean);
+    if (!candidateFlowId || candidateFlowId.toLowerCase() !== expectedFlowId.toLowerCase()) return null;
 
     if (anyCandidate.definition && anyCandidate.connectionReferences) {
       return {
@@ -158,6 +186,7 @@ type ProbeState = {
           connectionReferences: anyCandidate.connectionReferences,
           definition: anyCandidate.definition,
         },
+        flowId: candidateFlowId,
         source,
       };
     }
@@ -169,6 +198,7 @@ type ProbeState = {
           connectionReferences: anyCandidate.properties.connectionReferences,
           definition: anyCandidate.properties.definition,
         },
+        flowId: candidateFlowId,
         source,
       };
     }
@@ -176,7 +206,7 @@ type ProbeState = {
     return null;
   };
 
-  const searchObjectGraph = (root: unknown, source: string) => {
+  const searchObjectGraph = (root: unknown, source: string, expectedFlowId: string | null) => {
     const queue: Array<{ depth: number; value: unknown }> = [{ depth: 0, value: root }];
     const seen = new WeakSet<object>();
     const maxDepth = 8;
@@ -195,7 +225,7 @@ type ProbeState = {
       seen.add(value);
       visited += 1;
 
-      const normalized = normalizeCandidate(value, source);
+      const normalized = normalizeCandidate(value, source, expectedFlowId);
       if (normalized) {
         postSnapshot(normalized);
       }
@@ -228,19 +258,21 @@ type ProbeState = {
     candidateRoots.push((window as unknown as Record<string, unknown>).__PRELOADED_STATE__);
 
     for (const candidate of candidateRoots.filter(Boolean)) {
-      searchObjectGraph(candidate, 'page-state');
+      searchObjectGraph(candidate, 'page-state', getCurrentContext().flowId);
     }
   };
 
   const inspectResponsePayload = (payload: unknown, source: string, url: string | undefined) => {
     if (!payload) return;
 
+    const urlFlowId = url?.match(/flows\/([0-9a-f]{8}-[0-9a-f-]{27,})/i)?.[1] || null;
     searchObjectGraph(
       {
         payload,
         url,
       },
       source,
+      urlFlowId || getCurrentContext().flowId,
     );
   };
 

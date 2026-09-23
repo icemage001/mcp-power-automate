@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { getActiveTarget, saveActiveTarget } from './active-target-store.js';
 import type {
   BridgeMode,
@@ -22,6 +24,7 @@ import { getLatestCaptureDiagnostic, getLatestCaptureDiagnosticForFlow } from '.
 import { getCapturedSession, listCapturedSessions } from './captured-sessions-store.js';
 import { hasManageSolutionsTokens } from './dataverse-client.js';
 import { getFlowCatalogForEnv, saveFlowCatalog } from './flow-catalog-store.js';
+import { getFlowBackups, saveFlowBackup } from './flow-backup-store.js';
 import { getFlowSnapshot, getFlowSnapshotForFlow } from './flow-snapshot-store.js';
 import { getLastRun, getLastRunForFlow, saveLastRun } from './last-run-store.js';
 import type {
@@ -38,6 +41,7 @@ import type {
   ListFlowsInput,
   ListRunsInput,
   NormalizedFlow,
+  PreviewFlowUpdateInput,
   RunSummary,
   Session,
   TargetRef,
@@ -126,6 +130,17 @@ const ensureSession = (): Session => {
   }
 
   return session;
+};
+
+const requireExplicitTarget = (target?: TargetRef): TargetRef => {
+  if (!target?.envId || !target.flowId) {
+    throw new PowerAutomateSessionError({
+      code: 'NO_TARGET',
+      message: 'This operation requires an explicit {envId, flowId} target.',
+      retryable: false,
+    });
+  }
+  return target;
 };
 
 const createTabTargetFromSession = (session: Session): ActiveTarget | null => {
@@ -225,15 +240,13 @@ export const selectWorkTab = async ({ tabId }: { tabId: number }) => {
     tabId,
   });
 
-  if (!getActiveTarget(session.envId)) {
-    await saveActiveTarget({
-      displayName: null,
-      envId: session.envId,
-      flowId: session.flowId,
-      selectedAt: new Date().toISOString(),
-      selectionSource: 'tab-capture',
-    });
-  }
+  await saveActiveTarget({
+    displayName: resolveFlowDisplayName(session),
+    envId: session.envId,
+    flowId: session.flowId,
+    selectedAt: new Date().toISOString(),
+    selectionSource: 'tab-capture',
+  });
 
   return {
     selectedWorkSession: summarizeCapturedSession(session),
@@ -242,6 +255,14 @@ export const selectWorkTab = async ({ tabId }: { tabId: number }) => {
 
 const ensureTargetSession = (target?: TargetRef): TargetSession => {
   const session = ensureSession();
+  if (target && target.envId.toLowerCase() !== session.envId.toLowerCase()) {
+    throw new PowerAutomateError({
+      code: 'TARGET_MISMATCH',
+      details: { capturedEnvId: session.envId, requestedEnvId: target.envId },
+      message: 'Open or select a flow in the requested environment so the captured credentials and target environment match.',
+      retryable: false,
+    });
+  }
   const resolvedTarget = resolveTarget(session, target);
 
   if (!resolvedTarget?.flowId) {
@@ -373,7 +394,12 @@ const getPreferredLegacySession = (session: Session): PreferredLegacySession | n
   };
 };
 
-const normalizeFlow = (session: Pick<Session, 'envId' | 'flowId'>, flowResponse: AnyRecord): NormalizedFlow => {
+const normalizeFlow = (
+  session: Pick<Session, 'envId' | 'flowId'>,
+  flowResponse: AnyRecord,
+  verifyIdentity = false,
+): NormalizedFlow => {
+  if (verifyIdentity) assertFlowResponseIdentity(session, flowResponse);
   const properties = flowResponse?.properties || {};
 
   return {
@@ -387,6 +413,123 @@ const normalizeFlow = (session: Pick<Session, 'envId' | 'flowId'>, flowResponse:
     },
     flowId: session.flowId,
   };
+};
+
+const assertFlowResponseIdentity = (target: Pick<Session, 'envId' | 'flowId'>, response: AnyRecord) => {
+  const returnedId = response?.name || response?.id || response?.properties?.flowId;
+  const returnedFlowId = typeof returnedId === 'string' ? extractNameFromId(returnedId) : null;
+  if (!returnedFlowId || returnedFlowId.toLowerCase() !== target.flowId.toLowerCase()) {
+    throw new PowerAutomateError({
+      code: 'TARGET_MISMATCH',
+      details: { expectedFlowId: target.flowId, returnedFlowId },
+      message: 'Power Automate returned a different or unidentified flow. The update was stopped.',
+      retryable: false,
+    });
+  }
+  const environmentValue = response?.properties?.environment;
+  const environmentIdentity = typeof environmentValue === 'string' ? environmentValue : environmentValue?.name;
+  if (typeof environmentIdentity === 'string') {
+    const returnedEnvId = environmentIdentity.match(/environments\/([^/?]+)/i)?.[1] || extractNameFromId(environmentIdentity);
+    const normalizeEnvId = (value: string) => value.toLowerCase().replace(/^default-/, '');
+    if (returnedEnvId && normalizeEnvId(returnedEnvId) !== normalizeEnvId(target.envId)) {
+      throw new PowerAutomateError({
+        code: 'TARGET_MISMATCH',
+        details: { expectedEnvId: target.envId, returnedEnvId },
+        message: 'Power Automate returned a flow from a different environment. The update was stopped.',
+        retryable: false,
+      });
+    }
+  }
+};
+
+const canonicalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, canonicalize(child)]),
+  );
+};
+
+const hashFlow = (flow: NormalizedFlow) =>
+  createHash('sha256')
+    .update(JSON.stringify(canonicalize({
+      displayName: flow.displayName,
+      envId: flow.envId,
+      flow: flow.flow,
+      flowId: flow.flowId,
+    })))
+    .digest('hex');
+
+let flowWriteQueue: Promise<void> = Promise.resolve();
+
+const withFlowWriteLock = async <T>(operation: () => Promise<T>) => {
+  const previous = flowWriteQueue;
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  flowWriteQueue = previous.then(() => current);
+  await previous;
+
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+};
+
+const hashPreview = (before: NormalizedFlow, after: NormalizedFlow) =>
+  createHash('sha256')
+    .update(JSON.stringify(canonicalize({
+      after: hashFlow(after),
+      before: hashFlow(before),
+      envId: before.envId,
+      flowId: before.flowId,
+    })))
+    .digest('hex');
+
+const getHighRiskReasons = (before: NormalizedFlow, after: NormalizedFlow) => {
+  const reasons: string[] = [];
+  if ((before.displayName || '') !== (after.displayName || '')) reasons.push('flow-renamed');
+  if (JSON.stringify(canonicalize(before.flow.connectionReferences)) !== JSON.stringify(canonicalize(after.flow.connectionReferences))) {
+    reasons.push('connections-changed');
+  }
+  if (
+    JSON.stringify(canonicalize(before.flow.definition.triggers || {})) !==
+    JSON.stringify(canonicalize(after.flow.definition.triggers || {}))
+  ) {
+    reasons.push('triggers-changed');
+  }
+
+  const collectActionPaths = (definition: unknown) => {
+    const paths = new Set<string>();
+    const visit = (value: unknown, path: string[], seen: WeakSet<object>) => {
+      if (!value || typeof value !== 'object' || seen.has(value)) return;
+      seen.add(value);
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        if (key === 'actions' && child && typeof child === 'object' && !Array.isArray(child)) {
+          for (const [name, action] of Object.entries(child as Record<string, unknown>)) {
+            const actionPath = [...path, name];
+            paths.add(actionPath.join('/'));
+            visit(action, actionPath, seen);
+          }
+        } else {
+          visit(child, [...path, key], seen);
+        }
+      }
+    };
+    visit(definition, [], new WeakSet<object>());
+    return paths;
+  };
+  const beforeActions = collectActionPaths(before.flow.definition);
+  const afterActions = collectActionPaths(after.flow.definition);
+  const removedCount = [...beforeActions].filter((actionPath) => !afterActions.has(actionPath)).length;
+  if (removedCount >= 5 || (beforeActions.size >= 4 && removedCount / beforeActions.size >= 0.3)) {
+    reasons.push('many-actions-removed');
+  }
+  return reasons;
 };
 
 const normalizeFlowCatalogItem = (
@@ -690,15 +833,22 @@ export const getStatus = () => {
   };
 };
 
-const fetchCurrentNormalizedFlow = async (session: TargetSession) => {
+const fetchCurrentNormalizedFlow = async (
+  session: TargetSession,
+  { allowSnapshot = true, verifyIdentity = false }: { allowSnapshot?: boolean; verifyIdentity?: boolean } = {},
+) => {
   try {
     const flowResponse = await fetchRawFlowModern(session);
-    return normalizeFlow(session, flowResponse);
-  } catch {
+    return normalizeFlow(session, flowResponse, verifyIdentity);
+  } catch (modernError) {
+    if (modernError instanceof PowerAutomateError && modernError.code === 'TARGET_MISMATCH') throw modernError;
     try {
       const legacyFlowResponse = await fetchRawFlowLegacy(session);
+      if (verifyIdentity) assertFlowResponseIdentity(session, legacyFlowResponse);
       return normalizeLegacyFlow(session, legacyFlowResponse);
     } catch (legacyError) {
+      if (legacyError instanceof PowerAutomateError && legacyError.code === 'TARGET_MISMATCH') throw legacyError;
+      if (!allowSnapshot) throw legacyError;
       const snapshot = getFlowSnapshotForFlow({ envId: session.envId, flowId: session.flowId }) || getFlowSnapshot();
 
       if (snapshot && snapshot.flowId === session.flowId && snapshot.envId === session.envId) {
@@ -729,8 +879,21 @@ const buildProposedFlow = ({
 });
 
 export const getCurrentFlow = async ({ target }: { target?: TargetRef } = {}) => {
+  if (!target) {
+    const session = ensureSession();
+    const activeTarget = getActiveTarget(session.envId);
+    if (activeTarget && activeTarget.flowId.toLowerCase() !== session.flowId.toLowerCase()) {
+      throw new PowerAutomateError({
+        code: 'TARGET_MISMATCH',
+        details: { activeFlowId: activeTarget.flowId, currentTabFlowId: session.flowId },
+        message: 'The browser tab and selected MCP flow differ. Pass the intended {envId, flowId} explicitly.',
+        retryable: false,
+      });
+    }
+  }
   const session = ensureTargetSession(target);
-  return fetchCurrentNormalizedFlow(session);
+  const flow = await fetchCurrentNormalizedFlow(session);
+  return { ...flow, flowHash: hashFlow(flow) };
 };
 
 export const refreshFlows = async () => {
@@ -1027,13 +1190,16 @@ const persistLastUpdate = async ({ after, before }: { after: NormalizedFlow; bef
   return lastUpdate;
 };
 
-export const previewFlowUpdate = async ({ displayName, flow, target }: UpdateFlowInput) => {
-  const session = ensureTargetSession(target);
-  const before = await fetchCurrentNormalizedFlow(session);
+export const previewFlowUpdate = async ({ displayName, flow, target }: PreviewFlowUpdateInput) => {
+  const session = ensureTargetSession(requireExplicitTarget(target));
+  const before = await fetchCurrentNormalizedFlow(session, { allowSnapshot: false, verifyIdentity: true });
   const after = buildProposedFlow({ before, displayName, flow });
 
   return {
+    expectedFlowHash: hashFlow(before),
+    highRiskReasons: getHighRiskReasons(before, after),
     lastUpdate: createLastUpdateRecord({ after, before }),
+    previewHash: hashPreview(before, after),
     target: {
       displayName: session.targetDisplayName,
       envId: session.envId,
@@ -1042,8 +1208,11 @@ export const previewFlowUpdate = async ({ displayName, flow, target }: UpdateFlo
   };
 };
 
-const updateCurrentFlowModern = async (session: TargetSession, { displayName, flow }: UpdateFlowInput) => {
-  const before = normalizeFlow(session, await fetchRawFlowModern(session));
+const updateCurrentFlowModern = async (
+  session: TargetSession,
+  { displayName, flow }: Pick<PreviewFlowUpdateInput, 'displayName' | 'flow'>,
+  before: NormalizedFlow,
+) => {
   const currentProperties = {
     connectionReferences: before.flow.connectionReferences,
     definition: before.flow.definition,
@@ -1051,7 +1220,7 @@ const updateCurrentFlowModern = async (session: TargetSession, { displayName, fl
     environment: before.environment,
   };
 
-  const updatedFlow = await requestJson<AnyRecord>({
+  await requestJson<AnyRecord>({
     apiVersion: MODERN_API_VERSION,
     baseUrl: session.apiUrl,
     body: {
@@ -1067,22 +1236,23 @@ const updateCurrentFlowModern = async (session: TargetSession, { displayName, fl
     token: session.apiToken,
   });
 
-  const after = normalizeFlow(session, updatedFlow);
-  const lastUpdate = await persistLastUpdate({ after, before });
-  return {
-    flow: after,
-    lastUpdate,
-  };
+  const afterResponse = await fetchRawFlowModern(session);
+  const after = normalizeFlow(session, afterResponse, true);
+  assertUpdatedDefinition(after, { before, displayName, flow });
+  return after;
 };
 
-const updateCurrentFlowLegacy = async (session: TargetSession, { displayName, flow }: UpdateFlowInput) => {
+const updateCurrentFlowLegacy = async (
+  session: TargetSession,
+  { displayName, flow }: Pick<PreviewFlowUpdateInput, 'displayName' | 'flow'>,
+  before: NormalizedFlow,
+) => {
   const legacySession = getPreferredLegacySession(session);
 
   if (!legacySession) {
     throw createFlowServiceTokenMissingError(session);
   }
 
-  const before = normalizeLegacyFlow(session, await fetchRawFlowLegacy(session));
   const currentProperties = {
     connectionReferences: before.flow.connectionReferences,
     definition: before.flow.definition,
@@ -1090,7 +1260,7 @@ const updateCurrentFlowLegacy = async (session: TargetSession, { displayName, fl
     environment: before.environment,
   };
 
-  const updatedFlow = await requestJson<AnyRecord>({
+  await requestJson<AnyRecord>({
     apiVersion: LEGACY_API_VERSION,
     baseUrl: legacySession.baseUrl,
     body: {
@@ -1106,22 +1276,102 @@ const updateCurrentFlowLegacy = async (session: TargetSession, { displayName, fl
     token: legacySession.token,
   });
 
-  const after = normalizeLegacyFlow(session, updatedFlow);
-  const lastUpdate = await persistLastUpdate({ after, before });
-  return {
-    flow: after,
-    lastUpdate,
-  };
+  const afterResponse = await fetchRawFlowLegacy(session);
+  assertFlowResponseIdentity(session, afterResponse);
+  const after = normalizeLegacyFlow(session, afterResponse);
+  assertUpdatedDefinition(after, { before, displayName, flow });
+  return after;
 };
 
-export const applyFlowUpdate = async ({ displayName, flow, target }: UpdateFlowInput) => {
-  const session = ensureTargetSession(target);
+const assertUpdatedDefinition = (
+  after: NormalizedFlow,
+  { before, displayName, flow }: { before: NormalizedFlow; displayName?: string; flow: FlowContent },
+) => {
+  const expected = buildProposedFlow({ before, displayName, flow });
+  if (hashFlow(after) !== hashFlow(expected)) {
+    throw new PowerAutomateError({
+      code: 'UNKNOWN',
+      details: { expectedFlowHash: hashFlow(expected), returnedFlowHash: hashFlow(after) },
+      message: 'The saved flow did not match the proposed definition when read back. Inspect the flow before retrying.',
+      retryable: false,
+    });
+  }
+};
+
+const isExplicitModernApiCompatibilityError = (error: unknown) => {
+  if (!(error instanceof PowerAutomateError)) return false;
+  const details = error.details as { providerCode?: unknown; status?: unknown } | undefined;
+  if (details?.status === 405) return true;
+  return typeof details?.providerCode === 'string' && /unsupported.?api.?version|api.?version.?not.?supported/i.test(details.providerCode);
+};
+
+const applyFlowUpdateUnlocked = async ({
+  confirmHighRisk,
+  displayName,
+  expectedFlowHash,
+  flow,
+  previewHash: suppliedPreviewHash,
+  target,
+}: UpdateFlowInput) => {
+  const session = ensureTargetSession(requireExplicitTarget(target));
+  const before = await fetchCurrentNormalizedFlow(session, { allowSnapshot: false, verifyIdentity: true });
+  const actualFlowHash = hashFlow(before);
+  if (actualFlowHash !== expectedFlowHash) {
+    throw new PowerAutomateError({
+      code: 'TARGET_MISMATCH',
+      details: { actualFlowHash, expectedFlowHash, target },
+      message: 'The flow changed after preview. Fetch the current flow and preview the edit again.',
+      retryable: false,
+    });
+  }
+
+  const afterProposal = buildProposedFlow({ before, displayName, flow });
+  const actualPreviewHash = hashPreview(before, afterProposal);
+  if (actualPreviewHash !== suppliedPreviewHash) {
+    throw new PowerAutomateError({
+      code: 'TARGET_MISMATCH',
+      details: { actualPreviewHash, suppliedPreviewHash, target },
+      message: 'The proposed edit differs from the reviewed preview. Preview this exact definition again.',
+      retryable: false,
+    });
+  }
+
+  const highRiskReasons = getHighRiskReasons(before, afterProposal);
+  if (highRiskReasons.length > 0 && confirmHighRisk !== true) {
+    throw new PowerAutomateError({
+      code: 'TARGET_MISMATCH',
+      details: { highRiskReasons, previewHash: actualPreviewHash, target },
+      message: 'This edit includes high-risk changes. Review the preview and explicitly confirm before applying it.',
+      retryable: false,
+    });
+  }
+
+  await saveFlowBackup(before, actualFlowHash);
+  let after: NormalizedFlow;
 
   try {
-    return await updateCurrentFlowModern(session, { displayName, flow });
-  } catch {
-    return updateCurrentFlowLegacy(session, { displayName, flow });
+    after = await updateCurrentFlowModern(session, { displayName, flow }, before);
+  } catch (error) {
+    if (!isExplicitModernApiCompatibilityError(error)) throw error;
+    const legacyBefore = await fetchCurrentNormalizedFlow(session, { allowSnapshot: false, verifyIdentity: true });
+    if (hashFlow(legacyBefore) !== actualFlowHash) {
+      throw new PowerAutomateError({
+        code: 'TARGET_MISMATCH',
+        details: { actualFlowHash: hashFlow(legacyBefore), expectedFlowHash: actualFlowHash, target },
+        message: 'The flow changed while switching API endpoints. No fallback update was sent.',
+        retryable: false,
+      });
+    }
+    after = await updateCurrentFlowLegacy(session, { displayName, flow }, before);
   }
+
+  const lastUpdate = await persistLastUpdate({ after, before });
+  return { flow: after, lastUpdate };
+};
+
+export const applyFlowUpdate = async (input: UpdateFlowInput) => {
+  const target = requireExplicitTarget(input?.target);
+  return withFlowWriteLock(() => applyFlowUpdateUnlocked({ ...input, target }));
 };
 
 export const updateCurrentFlow = async (input: UpdateFlowInput) => {
@@ -1490,8 +1740,18 @@ export const getContextPayload = ({ bridgeMode = 'owned' }: { bridgeMode?: Bridg
   ok: true,
 });
 
-export const revertLastUpdate = async ({ target }: { target?: TargetRef } = {}) => {
-  const session = ensureTargetSession(target);
+export const listFlowBackups = ({ target }: { target: TargetRef }) => getFlowBackups(target);
+
+export const revertLastUpdate = async ({
+  confirmHighRisk,
+  expectedFlowHash,
+  target,
+}: {
+  confirmHighRisk?: boolean;
+  expectedFlowHash: string;
+  target: TargetRef;
+}) => {
+  const session = ensureTargetSession(requireExplicitTarget(target));
   const lastUpdate = getLastUpdateForFlow(session) || getLastUpdate();
 
   if (!lastUpdate) {
@@ -1508,9 +1768,27 @@ export const revertLastUpdate = async ({ target }: { target?: TargetRef } = {}) 
     });
   }
 
-  return applyFlowUpdate({
+  const current = await fetchCurrentNormalizedFlow(session, { allowSnapshot: false, verifyIdentity: true });
+  if (hashFlow(current) !== expectedFlowHash) {
+    throw new PowerAutomateError({
+      code: 'TARGET_MISMATCH',
+      details: { actualFlowHash: hashFlow(current), expectedFlowHash, target },
+      message: 'The flow changed after it was inspected. Fetch the current flow again before reverting.',
+      retryable: false,
+    });
+  }
+  const proposedRevert = buildProposedFlow({
+    before: current,
     displayName: lastUpdate.before.displayName,
     flow: lastUpdate.before.flow,
+  });
+
+  return applyFlowUpdate({
+    confirmHighRisk,
+    displayName: lastUpdate.before.displayName,
+    expectedFlowHash,
+    flow: lastUpdate.before.flow,
+    previewHash: hashPreview(current, proposedRevert),
     target: {
       envId: session.envId,
       flowId: session.flowId,
@@ -1650,7 +1928,7 @@ const getCurrentTriggerName = async (target?: TargetRef) => {
 };
 
 export const validateCurrentFlow = async ({ flow, target }: ValidateFlowInput) => {
-  const session = ensureTargetSession(target);
+  const session = ensureTargetSession(requireExplicitTarget(target));
   const legacySession = getPreferredLegacySession(session);
 
   if (!legacySession) {
@@ -1855,10 +2133,11 @@ export const invokeTrigger = async ({
   triggerName,
 }: {
   body?: unknown;
-  target?: TargetRef;
+  target: TargetRef;
   triggerName?: string;
-} = {}) => {
-  const callback = await getTriggerCallbackUrl({ target, triggerName });
+}) => {
+  const explicitTarget = requireExplicitTarget(target);
+  const callback = await getTriggerCallbackUrl({ target: explicitTarget, triggerName });
 
   if (!callback.url) {
     throw new PowerAutomateSessionError({

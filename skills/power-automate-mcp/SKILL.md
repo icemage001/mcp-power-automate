@@ -15,14 +15,16 @@ Provider notes live in [references/providers.md](references/providers.md).
 
 1. Start with `doctor` or `get_context`.
 2. Use `connect_flow` when the target is not already explicit.
-3. Prefer browser-captured flows, explicit `flowId`, or a narrow `nameQuery`; if `connect_flow` returns candidates, choose by `flowId` or ask the user which flow is intended.
-4. Call `get_flow` before edits.
-5. Call `preview_flow_update` before saving.
-6. Call `validate_flow` before and after save when available.
-7. Call `apply_flow_update` only for the smallest intended change.
+3. Identify the target by both `envId` and `flowId`; do not use a name or browser tab as write authorization.
+4. Call `get_flow` for that explicit target before edits.
+5. Call `preview_flow_update` with the same target and candidate definition before saving. Keep its `expectedFlowHash` and `previewHash` with that exact proposal.
+6. Call `validate_flow` with the same explicit target before and after save when available.
+7. If `highRiskReasons` is non-empty, explain the exact changes and obtain the user's explicit approval before proceeding. Then call `apply_flow_update` with the same target, candidate definition, both hashes, and `confirmHighRisk: true`. If it reports that the flow changed, fetch and preview again.
 8. Call `get_last_update` after save and summarize the review diff.
-9. Use `revert_last_update` if the saved result is wrong.
-10. Prefer test or staging flows before production flows.
+9. Use `get_flow_backups` to inspect immutable pre-update backups for that target.
+10. To revert the last edit, call `get_flow` for the explicit target and pass its current `flowHash` to `revert_last_update`. If the tool reports high-risk changes, review `get_last_update`, obtain explicit user approval, then retry with `confirmHighRisk: true`.
+11. Pass an explicit target to `invoke_trigger`; it runs the flow and may cause business side effects.
+12. Prefer test or staging flows before production flows.
 
 ## Recommended Workflows
 
@@ -51,21 +53,22 @@ Use solution write tools only for unmanaged solutions and only when adding cloud
 
 1. `doctor`
 2. `connect_flow`
-3. `get_flow`
-4. Build the smallest candidate flow change.
-5. `preview_flow_update`
-6. `validate_flow`
-7. `apply_flow_update`
-8. `get_last_update`
-9. `validate_flow` again when available
+3. Set `{envId, flowId}` explicitly from the intended flow.
+4. `get_flow` for that explicit target; retain its `flowHash` for potential revert.
+5. Build the smallest candidate flow change.
+6. `preview_flow_update` for that target and candidate.
+7. `validate_flow` for that target.
+8. `apply_flow_update` with both preview hashes, the same target, and the same candidate. If high-risk changes are reported, pause for the user's explicit approval.
+9. `get_last_update`
+10. `validate_flow` again when available
 
 ### Manual Trigger Test
 
 Use only when the trigger is manual/request based and the payload is safe.
 
-1. `get_flow`
-2. `get_trigger_callback_url`
-3. `invoke_trigger`
+1. `get_flow` for an explicit `{envId, flowId}`
+2. `get_trigger_callback_url` for that same target
+3. `invoke_trigger` with that same target
 4. `wait_for_run`
 5. `get_run`
 6. `get_run_actions`
@@ -84,6 +87,7 @@ Use only when the trigger is manual/request based and the payload is safe.
 - `preview_flow_update`
 - `validate_flow`
 - `apply_flow_update`
+- `get_flow_backups`
 - `get_last_update`
 - `revert_last_update`
 - `list_runs`

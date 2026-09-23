@@ -55,10 +55,10 @@ Ask your MCP client to:
 1. `doctor`
 2. `get_context`
 3. `connect_flow`
-4. `get_flow`
-5. `preview_flow_update`
-6. `validate_flow`
-7. `apply_flow_update`
+4. Choose the exact `{envId, flowId}` target and call `get_flow` with it.
+5. Call `preview_flow_update` with that target and the candidate definition; retain its `expectedFlowHash` and `previewHash`.
+6. `validate_flow` for the same target.
+7. `apply_flow_update` with the same target, candidate, and both preview hashes. If the preview reports high-risk changes, obtain explicit user approval before setting `confirmHighRisk: true`.
 8. `get_last_update`
 
 For run inspection and manual/request trigger tests, use `list_runs`, `get_latest_run`, `get_run`, `get_run_actions`, `wait_for_run`, `get_trigger_callback_url`, and `invoke_trigger`.
@@ -79,6 +79,7 @@ For Dataverse solution work, use `list_solutions`, `list_solution_components`, `
 - `preview_flow_update`
 - `validate_flow`
 - `apply_flow_update`
+- `get_flow_backups`
 - `get_last_update`
 - `revert_last_update`
 - `list_runs`
@@ -120,11 +121,17 @@ Only the process that owns the bridge port executes stateful work. Other MCP ins
 
 ## Safety Model
 
-- Use `preview_flow_update` before saves.
+- Flow edits, validation, trigger calls, and reverts require an explicit `{envId, flowId}` target. The captured session must be from the same environment.
+- `preview_flow_update` returns `expectedFlowHash` for the live baseline and `previewHash` for that exact proposed definition. `apply_flow_update` rejects either stale or changed content and requires a live server read. A browser snapshot is not accepted as the edit baseline.
+- Renames, trigger or connection changes, and bulk action removal are marked high risk and require the caller to set `confirmHighRisk: true` after user approval.
+- A successful edit is read back from the requested flow and compared with the proposal before it is reported as saved. Legacy API fallback is limited to explicit endpoint compatibility failures.
+- Each edit writes an append-only pre-update backup to local `data/flow-backups.json`. Use `get_flow_backups` to retrieve a prior definition; restore it with `apply_flow_update` after a fresh preview.
 - Use `validate_flow` before and after meaningful edits when available.
 - Use `get_last_update` to review the persisted diff.
-- Use `revert_last_update` if the saved result is wrong.
+- Use `get_flow` to capture the current `flowHash`, then pass it with the explicit target to `revert_last_update` if the saved result is wrong.
 - Prefer test or staging flows before production flows.
+
+The hash check catches changes made between preview and save. The current Power Automate request path does not use an ETag/conditional PATCH, so it cannot make the read-and-write sequence atomic against another client editing at the same moment.
 
 If Power Automate rejects a save because of a connection permission problem, the MCP reports `CONNECTION_AUTHORIZATION_FAILED` and waits for the user to fix that connection in Power Automate. If the service rejects a field such as `retryPolicy`, the MCP reports `SCHEMA_VALIDATION_FAILED` with the rejected member so the AI can correct the candidate flow instead of guessing.
 

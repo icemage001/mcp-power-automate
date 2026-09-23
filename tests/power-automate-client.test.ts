@@ -22,6 +22,7 @@ const activeTarget = {
 };
 
 const baseFlowResponse = {
+  name: 'flow-a',
   properties: {
     connectionReferences: {},
     definition: {
@@ -38,6 +39,7 @@ const baseFlowResponse = {
 };
 
 const updatedFlowResponse = {
+  name: 'flow-a',
   properties: {
     connectionReferences: {},
     definition: {
@@ -96,6 +98,7 @@ describe('power automate client', () => {
         connectionReferences: {},
         definition: updatedFlowResponse.properties.definition,
       },
+      target: { envId: activeTarget.envId, flowId: activeTarget.flowId },
     });
 
     expect(result.lastUpdate.summary.changedDisplayName).toBe(true);
@@ -112,19 +115,30 @@ describe('power automate client', () => {
     await sessionStore.saveSession(validSession);
     await targetStore.saveActiveTarget(activeTarget);
 
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (_input, init) =>
-        init?.method === 'PATCH' ? createJsonResponse(updatedFlowResponse) : createJsonResponse(baseFlowResponse),
-      ),
-    );
+    let saved = false;
+    vi.stubGlobal('fetch', vi.fn(async (_input, init) => {
+      if (init?.method === 'PATCH') {
+        saved = true;
+        return createJsonResponse(updatedFlowResponse);
+      }
+      return createJsonResponse(saved ? updatedFlowResponse : baseFlowResponse);
+    }));
 
-    const result = await client.applyFlowUpdate({
+    const proposal = {
       displayName: 'Flow B',
       flow: {
         connectionReferences: {},
         definition: updatedFlowResponse.properties.definition,
       },
+      target: { envId: activeTarget.envId, flowId: activeTarget.flowId },
+    };
+    const preview = await client.previewFlowUpdate(proposal);
+
+    const result = await client.applyFlowUpdate({
+      ...proposal,
+      confirmHighRisk: true,
+      expectedFlowHash: preview.expectedFlowHash,
+      previewHash: preview.previewHash,
     });
 
     expect(result.flow.displayName).toBe('Flow B');
